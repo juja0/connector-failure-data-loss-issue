@@ -24,8 +24,6 @@ import io.debezium.engine.source.EngineSourceTask;
 import io.debezium.pipeline.signal.actions.snapshotting.ExecuteSnapshot;
 import io.debezium.pipeline.signal.channels.process.InProcessSignalChannel;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
-import lombok.Cleanup;
-import lombok.SneakyThrows;
 import org.apache.commons.lang3.reflect.FieldUtils;
 import org.apache.commons.lang3.time.StopWatch;
 import org.apache.kafka.connect.data.Field;
@@ -79,7 +77,7 @@ public class SnapshotFailureDataLossIssueTest
 
 	private static final int TABLE_1_INITIAL_ROWS_COUNT = 10;
 	private static final int TABLE_1_BULK_INSERT_ROWS_COUNT = 200;
-	private static final int TABLE_2_ROWS_COUNT = 200;
+	private static final int TABLE_2_ROWS_COUNT = 100;
 
 	private final PostgreSQLContainer<?> pgContainer;
 
@@ -279,7 +277,21 @@ public class SnapshotFailureDataLossIssueTest
 
 		var engine = asyncEngineBuilder()
 				.using(this.getConfiguration(testId, tables))
-				.notifying((records, committer) -> this.processBatch(engineRef, records, committer))
+				.notifying((records, committer) ->
+				{
+					try
+					{
+						this.processBatch(engineRef, records, committer);
+					}
+					catch (RuntimeException e)
+					{
+						throw e;
+					}
+					catch (Exception e)
+					{
+						throw new RuntimeException(e);
+					}
+				})
 				.build();
 
 		engineRef.set(engine);
@@ -293,10 +305,9 @@ public class SnapshotFailureDataLossIssueTest
 		return engine;
 	}
 
-	@SneakyThrows
 	private void processBatch(
 			AtomicReference<DebeziumEngine<?>> engineRef,
-			List<ChangeEvent<SourceRecord, SourceRecord>> records, DebeziumEngine.RecordCommitter<ChangeEvent<SourceRecord, SourceRecord>> committer)
+			List<ChangeEvent<SourceRecord, SourceRecord>> records, DebeziumEngine.RecordCommitter<ChangeEvent<SourceRecord, SourceRecord>> committer) throws Exception
 	{
 		System.out.println();
 
@@ -369,10 +380,9 @@ public class SnapshotFailureDataLossIssueTest
 			statement.execute("CREATE TABLE table2 (id integer primary key, name varchar NULL)");
 		}
 
-		try (var connection = this.getConnection())
+		try (var connection = this.getConnection();
+			 var statement = connection.prepareStatement("INSERT INTO table1 VALUES (?, ?)"))
 		{
-			@Cleanup var statement = connection.prepareStatement("INSERT INTO table1 VALUES (?, ?)");
-
 			for (int i = 1; i <= TABLE_1_INITIAL_ROWS_COUNT; i++)
 			{
 				statement.setInt(1, i);
@@ -384,10 +394,9 @@ public class SnapshotFailureDataLossIssueTest
 			statement.executeBatch();
 		}
 
-		try (var connection = this.getConnection())
+		try (var connection = this.getConnection();
+			 var statement = connection.prepareStatement("INSERT INTO table2 VALUES (?, ?)"))
 		{
-			@Cleanup var statement = connection.prepareStatement("INSERT INTO table2 VALUES (?, ?)");
-
 			for (int i = 1; i <= TABLE_2_ROWS_COUNT; i++)
 			{
 				statement.setInt(1, i);
@@ -410,10 +419,9 @@ public class SnapshotFailureDataLossIssueTest
 
 	private void bulkInsertDataIntoTable1() throws SQLException
 	{
-		try (var connection = this.getConnection())
+		try (var connection = this.getConnection();
+			 var statement = connection.prepareStatement("INSERT INTO table1 VALUES (?, ?)"))
 		{
-			@Cleanup var statement = connection.prepareStatement("INSERT INTO table1 VALUES (?, ?)");
-
 			for (int i = TABLE_1_INITIAL_ROWS_COUNT + 1; i <= TABLE_1_BULK_INSERT_ROWS_COUNT; i++)
 			{
 				statement.setInt(1, i);
@@ -428,11 +436,11 @@ public class SnapshotFailureDataLossIssueTest
 
 	private int insertFinalRowIntoTable1() throws SQLException
 	{
-		try (var connection = this.getConnection())
-		{
-			@Cleanup var statement = connection.prepareStatement("INSERT INTO table1 VALUES (?, ?)");
+		int i = TABLE_1_BULK_INSERT_ROWS_COUNT + 1;
 
-			var i = TABLE_1_BULK_INSERT_ROWS_COUNT + 1;
+		try (var connection = this.getConnection();
+			 var statement = connection.prepareStatement("INSERT INTO table1 VALUES (?, ?)"))
+		{
 
 			statement.setInt(1, i);
 			statement.setString(2, "user" + i);
@@ -440,9 +448,9 @@ public class SnapshotFailureDataLossIssueTest
 			statement.addBatch();
 
 			statement.executeBatch();
-
-			return i;
 		}
+
+		return i;
 	}
 
 	private Properties getConfiguration(UUID testId, String... tables)
@@ -509,11 +517,10 @@ public class SnapshotFailureDataLossIssueTest
 	}
 
 	/**
-	 * Only for demonstration of potential workaround. 
+	 * Only for demonstration of potential (ugly) workaround. not actual fix.
 	 */
-	@SneakyThrows
 	@SuppressWarnings("unchecked")
-	private static void clearPendingOffsets(DebeziumEngine<?> engine)
+	private static void clearPendingOffsets(DebeziumEngine<?> engine) throws IllegalAccessException
 	{
 		var tasks = (List<EngineSourceTask>) FieldUtils.readField(engine, "tasks", true);
 
