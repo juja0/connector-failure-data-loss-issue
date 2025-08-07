@@ -20,6 +20,7 @@ import io.debezium.engine.ChangeEvent;
 import io.debezium.engine.DebeziumEngine;
 import io.debezium.engine.DebeziumEngine.Signal;
 import io.debezium.engine.format.KeyValueHeaderChangeEventFormat;
+import io.debezium.engine.source.EngineSourceTask;
 import io.debezium.pipeline.signal.actions.snapshotting.ExecuteSnapshot;
 import io.debezium.pipeline.signal.channels.process.InProcessSignalChannel;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
@@ -71,6 +72,8 @@ public class SnapshotFailureDataLossIssueTest
 
 		((Logger) LoggerFactory.getLogger("org.apache.kafka")).setLevel(Level.OFF);
 	}
+
+	private static final boolean APPLY_FIX = false; // possible workaround. not actual fix. 
 
 	private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -272,9 +275,14 @@ public class SnapshotFailureDataLossIssueTest
 	{
 		System.out.println("STARTING ENGINE");
 
-		var configuration = this.getConfiguration(testId, tables);
+		var engineRef = new AtomicReference<DebeziumEngine<?>>();
 
-		var engine = asyncEngineBuilder().using(configuration.asProperties()).notifying(this::processBatch).build();
+		var engine = asyncEngineBuilder()
+				.using(this.getConfiguration(testId, tables))
+				.notifying((records, committer) -> this.processBatch(engineRef, records, committer))
+				.build();
+
+		engineRef.set(engine);
 
 		Thread.ofPlatform().start(engine); // use platform thread so that it shows up in thread-dumps
 
@@ -286,44 +294,71 @@ public class SnapshotFailureDataLossIssueTest
 	}
 
 	@SneakyThrows
-	private void processBatch(List<ChangeEvent<SourceRecord, SourceRecord>> records, DebeziumEngine.RecordCommitter<ChangeEvent<SourceRecord, SourceRecord>> committer)
+	private void processBatch(
+			AtomicReference<DebeziumEngine<?>> engineRef,
+			List<ChangeEvent<SourceRecord, SourceRecord>> records, DebeziumEngine.RecordCommitter<ChangeEvent<SourceRecord, SourceRecord>> committer)
 	{
 		System.out.println();
 
-		for (var event : records)
+		var isSnapshotting = false;
+
+		for (var record : records)
 		{
-			var value = (Struct) event.value().value();
-
-			if (value.schema().fields().stream().map(Field::name).toList().contains(Envelope.FieldName.AFTER))
+			try
 			{
-				var source = value.getStruct(Envelope.FieldName.SOURCE);
-				var tableRow = value.getStruct(Envelope.FieldName.AFTER);
-
-				var lsn = source.getInt64(SourceInfo.LSN_KEY);
-				var table = source.getString(SourceInfo.TABLE_NAME_KEY);
-
-				var snapshotting = SnapshotRecord.fromSource(source) instanceof SnapshotRecord sr && sr.ordinal() <= SnapshotRecord.LAST.ordinal();
-
-				System.out.println("processed --> " + lsn + " - " + table + " - " + (snapshotting ? "snapshotting" : "streaming") + " - " + tableRow);
-
-				if (tableRow.getString("name").startsWith("badUser"))
+				isSnapshotting |= this.processRecord(record);
+			}
+			catch (Throwable t)
+			{
+				if (APPLY_FIX)
 				{
-					throw new Exception("badUser");
+					clearPendingOffsets(engineRef.get());
 				}
-
-				var rowValues = tableRow.schema().fields().stream().map(tableRow::get).toList();
-
-				Thread.sleep(100);
-
-				this.tableRows.computeIfAbsent(table, s -> ConcurrentHashMap.newKeySet()).add(rowValues);
+				throw t;
 			}
 
-			committer.markProcessed(event);
+			committer.markProcessed(record);
 		}
 
-		committer.markBatchFinished();
+		if (!APPLY_FIX || !isSnapshotting)
+		{
+			committer.markBatchFinished();
+		}
 
 		System.out.println();
+	}
+
+	private boolean processRecord(ChangeEvent<SourceRecord, SourceRecord> record) throws Exception
+	{
+		var value = (Struct) record.value().value();
+
+		if (value.schema().fields().stream().map(Field::name).toList().contains(Envelope.FieldName.AFTER))
+		{
+			var source = value.getStruct(Envelope.FieldName.SOURCE);
+			var tableRow = value.getStruct(Envelope.FieldName.AFTER);
+
+			var lsn = source.getInt64(SourceInfo.LSN_KEY);
+			var table = source.getString(SourceInfo.TABLE_NAME_KEY);
+
+			var snapshotting = SnapshotRecord.fromSource(source) instanceof SnapshotRecord sr && sr.ordinal() <= SnapshotRecord.LAST.ordinal();
+
+			System.out.println("processed --> " + lsn + " - " + table + " - " + (snapshotting ? "snapshotting" : "streaming") + " - " + tableRow);
+
+			if (tableRow.getString("name").startsWith("badUser"))
+			{
+				throw new Exception("badUser");
+			}
+
+			var rowValues = tableRow.schema().fields().stream().map(tableRow::get).toList();
+
+			Thread.sleep(100);
+
+			this.tableRows.computeIfAbsent(table, s -> ConcurrentHashMap.newKeySet()).add(rowValues);
+
+			return snapshotting;
+		}
+
+		return false;
 	}
 
 	private void setupTestDatabase() throws SQLException
@@ -410,7 +445,7 @@ public class SnapshotFailureDataLossIssueTest
 		}
 	}
 
-	private Configuration getConfiguration(UUID testId, String... tables)
+	private Properties getConfiguration(UUID testId, String... tables)
 	{
 		var builder = Configuration.create();
 
@@ -442,7 +477,7 @@ public class SnapshotFailureDataLossIssueTest
 		builder.with(CommonConnectorConfig.MAX_QUEUE_SIZE, 3);
 		builder.with(EmbeddedEngineConfig.OFFSET_FLUSH_INTERVAL_MS, "1000");
 
-		return builder.build();
+		return builder.build().asProperties();
 	}
 
 	private Connection getConnection() throws SQLException
@@ -471,6 +506,31 @@ public class SnapshotFailureDataLossIssueTest
 			}
 		}
 		throw new IllegalStateException("Unable to get engine state");
+	}
+
+	/**
+	 * Only for demonstration of potential workaround. 
+	 */
+	@SneakyThrows
+	@SuppressWarnings("unchecked")
+	private static void clearPendingOffsets(DebeziumEngine<?> engine)
+	{
+		var tasks = (List<EngineSourceTask>) FieldUtils.readField(engine, "tasks", true);
+
+		for (EngineSourceTask task : tasks)
+		{
+			var writer = task.context().offsetStorageWriter();
+
+			if (((Map<?, ?>) FieldUtils.readField(writer, "data", true)) instanceof Map<?, ?> data)
+			{
+				data.clear();
+			}
+
+			if (((Map<?, ?>) FieldUtils.readField(writer, "toFlush", true)) instanceof Map<?, ?> toFlush)
+			{
+				toFlush.clear();
+			}
+		}
 	}
 
 	private static String constructOffsetFileName(UUID testId)
